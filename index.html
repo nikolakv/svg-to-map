@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Custom SVG Overlay (Draggable & Point Generation) - Fixed Version</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    html, body {
+      margin: 0; padding: 0;
+      width: 100%; height: 100%;
+      font-family: Arial, sans-serif;
+    }
+    #map {
+      width: 100%;
+      height: 65%;
+    }
+    #controls {
+      padding: 10px;
+      background: #f0f0f0;
+    }
+    #controls input, #controls select, #controls button {
+      margin: 5px;
+    }
+    .my-svg-layer {
+      position: absolute;  /* Our custom overlay in Leaflet's overlayPane */
+      top: 0;
+      left: 0;
+      overflow: visible;   /* Let the SVG grow/overflow as needed */
+      pointer-events: none; /* Let clicks pass unless we specifically enable them in the SVG */
+    }
+    /* We re-enable pointer events inside the SVG so it can be dragged */
+    .my-svg-layer svg {
+      pointer-events: auto;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div id="controls">
+  <label>Upload SVG: <input type="file" id="svgFile" accept=".svg"></label>
+  <br/>
+  <label>Select Path:
+    <select id="pathSelector">
+      <option value="">(No SVG)</option>
+    </select>
+  </label>
+  <br/>
+  <label>Min Dist (m): <input type="number" id="minDist" value="5" /></label>
+  <label>Max Dist (m): <input type="number" id="maxDist" value="20" /></label>
+  <button id="btnGenerate">Generate Points</button>
+  <button id="btnExport">Export GeoJSON</button>
+</div>
+
+<!-- Leaflet JS -->
+<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<!-- svg.js + svg.draggable.js -->
+<script src="https://cdn.jsdelivr.net/npm/@svgdotjs/svg.js@3.1.2/dist/svg.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@svgdotjs/svg.draggable.js@3.0.2/dist/svg.draggable.min.js"></script>
+
+<!-- Load svg-path-properties from a local file (ensure it's the UMD build) -->
+<script src="./js/libs/svg-path-properties.js"></script>
+<script>
+  console.log("svgPathProperties:", svgPathProperties);
+</script>
+<script>
+/////////////////////////////
+// Custom Leaflet SVG Overlay
+/////////////////////////////
+const CustomSvgLayer = L.Layer.extend({
+  initialize: function(bounds, options) {
+    // The 'bounds' define the georeferenced area (lat/lng box) for the overlay.
+    L.Util.setOptions(this, options);
+    this._bounds = L.latLngBounds(bounds);
+  },
+
+  onAdd: function(map) {
+    this._map = map;
+
+    // Create the container <div> for our overlay
+    this._container = L.DomUtil.create('div', 'my-svg-layer');
+    this._map.getPanes().overlayPane.appendChild(this._container);
+
+    // Position the container to match the bounding box on the map
+    this._updatePosition();
+
+    // Listen to map events so we can reposition if the map moves/zooms
+    this._map.on('zoomend viewreset moveend', this._updatePosition, this);
+  },
+
+  onRemove: function() {
+    this._map.off('zoomend viewreset moveend', this._updatePosition, this);
+    if (this._container) {
+      L.DomUtil.remove(this._container);
+      this._container = null;
+    }
+  },
+
+  // Reposition the container <div> to match geographic bounds
+  _updatePosition: function() {
+    if (!this._map || !this._container) return;
+
+    const topLeft = this._map.latLngToLayerPoint(this._bounds.getNorthWest());
+    const bottomRight = this._map.latLngToLayerPoint(this._bounds.getSouthEast());
+    const size = bottomRight.subtract(topLeft);
+
+    // Position the container
+    L.DomUtil.setPosition(this._container, topLeft);
+
+    // Set container's dimensions to match the pixel bounds on the map
+    this._container.style.width = size.x + 'px';
+    this._container.style.height = size.y + 'px';
+  }
+});
+
+/**
+ * Convert a point in the local <svg> coordinate system (before transformation)
+ * and apply the current transformation from the <g> element (drag, scale, rotate)
+ * to determine its final geographic location.
+ */
+function pixelOffsetToLatLng(offsetX, offsetY, layer, svgWidth, svgHeight) {
+  const map = layer._map;
+  const bounds = layer._bounds;
+  
+  // Compute relative ratios within the SVG's native coordinate system
+  const xRatio = offsetX / svgWidth;
+  const yRatio = offsetY / svgHeight;
+  
+  const sw = bounds.getSouthWest();
+  const ne = bounds.getNorthEast();
+  
+  // Interpolate latitude and longitude
+  const lat = ne.lat - yRatio * (ne.lat - sw.lat);
+  const lng = sw.lng + xRatio * (ne.lng - sw.lng);
+  
+  return L.latLng(lat, lng);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Main Application Logic
+////////////////////////////////////////////////////////////////////////////////
+let map, svgLayer;       
+let svgRoot, svgGroup;   // svg.js references
+let userPaths = [];      
+let generatedPoints = [];  // {x, y} in the SVG coordinate system (without transform)
+let circleMarkers = [];    // L.circleMarker instances on the map
+let localSVGWidth = 300;   // default values
+let localSVGHeight = 300;
+
+function initMap() {
+  map = L.map('map').setView([0, 0], 2);
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19
+  }).addTo(map);
+
+  // Create initial SVG layer with dummy bounds.
+  // (We'll update these when an SVG is uploaded.)
+  const initialBounds = map.getBounds();
+  svgLayer = new CustomSvgLayer([
+    [initialBounds.getSouth(), initialBounds.getWest()],
+    [initialBounds.getNorth(), initialBounds.getEast()]
+  ]);
+  svgLayer.addTo(map);
+}
+
+function onSVGUploaded(svgText) {
+  // Parse the uploaded SVG text and get the <svg> element
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(svgText, "image/svg+xml");
+  const svgElem = doc.documentElement;
+
+  // Ensure width/height attributes exist (and set defaults if not)
+  if (svgElem.hasAttribute('width')) {
+    localSVGWidth = parseFloat(svgElem.getAttribute('width')) || 300;
+  } else {
+    svgElem.setAttribute('width', '300');
+    localSVGWidth = 300;
+  }
+  if (svgElem.hasAttribute('height')) {
+    localSVGHeight = parseFloat(svgElem.getAttribute('height')) || 300;
+  } else {
+    svgElem.setAttribute('height', '300');
+    localSVGHeight = 300;
+  }
+
+  // Clear any existing content in the overlay container
+  const container = svgLayer._container;
+  while (container.firstChild) {
+    container.removeChild(container.firstChild);
+  }
+  // Append the uploaded SVG into the overlay container
+  container.appendChild(svgElem);
+
+  // Initialize the svg.js instance on the uploaded SVG element
+  svgRoot = SVG(svgElem);
+
+  // Create a group (<g>) for dragging and future transformation operations.
+  // Then move each child node into this group.
+  svgGroup = svgRoot.group();
+  const childArray = Array.from(svgElem.childNodes);
+  childArray.forEach((node) => {
+    if (node !== svgGroup.node) {
+      svgGroup.node.appendChild(node);
+    }
+  });
+
+  // *** Key change: update the overlay bounds to match the SVG's native size ***
+  // Instead of applying the full map bounds, compute a rectangle that is
+  // localSVGWidth x localSVGHeight (in screen pixels) and center it on the map.
+  const mapCenter = map.getCenter();
+  const mapSize = map.getSize();
+  // Convert the center to a container point.
+  const centerPoint = map.latLngToContainerPoint(mapCenter);
+  // Compute top‐left and bottom‐right container points using half-dimensions.
+  const topLeftPoint = L.point(centerPoint.x - localSVGWidth / 2, centerPoint.y - localSVGHeight / 2);
+  const bottomRightPoint = L.point(centerPoint.x + localSVGWidth / 2, centerPoint.y + localSVGHeight / 2);
+  // Convert these container points back into lat/lng
+  const topLeftLatLng = map.containerPointToLatLng(topLeftPoint);
+  const bottomRightLatLng = map.containerPointToLatLng(bottomRightPoint);
+
+  // Set the overlay's bounds so that (0,0) in the SVG maps to topLeftLatLng
+  // and (localSVGWidth, localSVGHeight) maps to bottomRightLatLng.
+  svgLayer._bounds = L.latLngBounds(topLeftLatLng, bottomRightLatLng);
+  svgLayer._updatePosition();
+
+  // Hook up draggable events for the SVG group.
+  svgGroup.draggable()
+    .on('dragstart', e => {
+      if (e.event) {
+        e.event.preventDefault();
+        L.DomEvent.stopPropagation(e.event);
+      }
+      map.dragging.disable();
+    })
+    .on('dragmove', e => {
+      if (e.event) {
+        e.event.preventDefault();
+        L.DomEvent.stopPropagation(e.event);
+      }
+      // Update the overlay bounds (translation only for now):
+      updateOverlayBounds();
+    })
+    .on('dragend', e => {
+      if (e.event) {
+        e.event.preventDefault();
+        L.DomEvent.stopPropagation(e.event);
+      }
+      map.dragging.enable();
+      // Update the overlay bounds and redraw points (if any were generated)
+      updateOverlayBounds();
+      if (generatedPoints.length > 0) {
+        drawGeneratedPoints();
+      }
+    });
+
+  // Populate the dropdown selector with all <path> elements in the SVG.
+  userPaths = Array.from(svgElem.querySelectorAll('path'));
+  const sel = document.getElementById('pathSelector');
+  sel.innerHTML = "";
+  if (userPaths.length === 0) {
+    const opt = document.createElement('option');
+    opt.value = "";
+    opt.textContent = "No <path> in SVG";
+    sel.appendChild(opt);
+  } else {
+    userPaths.forEach((p, i) => {
+      const opt = document.createElement('option');
+      opt.value = i;
+      opt.textContent = p.id || `Path #${i+1}`;
+      sel.appendChild(opt);
+    });
+  }
+}
+
+function getSelectedPathD() {
+  const idx = parseInt(document.getElementById('pathSelector').value, 10);
+  if (isNaN(idx) || !userPaths[idx]) {
+    alert("Please select a valid path!");
+    return null;
+  }
+  return userPaths[idx].getAttribute('d');
+}
+
+// Generate points along the selected path in the SVG (without applying transforms)
+function generatePoints() {
+  if (!svgGroup) {
+    alert("Please upload an SVG first");
+    return;
+  }
+  const d = getSelectedPathD();
+  if (!d) return;
+
+  // Clear old generated points and remove previous markers from the map
+  generatedPoints = [];
+  circleMarkers.forEach(m => map.removeLayer(m));
+  circleMarkers = [];
+
+  // Read input distances which are now given in meters
+  const minDistMeters = parseFloat(document.getElementById('minDist').value);
+  const maxDistMeters = parseFloat(document.getElementById('maxDist').value);
+
+  // Calculate the conversion factor between SVG pixels and meters.
+  // We use the overlay's current geographic bounds.
+  // For example, compute how many meters the overlay's width covers.
+  const nw = svgLayer._bounds.getNorthWest(),
+        ne = svgLayer._bounds.getNorthEast();
+  const overlayWidthMeters = map.distance(nw, ne);
+  const meterPerSvgPixel = overlayWidthMeters / localSVGWidth; // meters per one SVG pixel
+  
+  // Convert the meter values to SVG (pixel) values.
+  const minDistPx = minDistMeters / meterPerSvgPixel;
+  const maxDistPx = maxDistMeters / meterPerSvgPixel;
+
+  // Resolve the svgPathProperties constructor
+  const SvgPathProperties =
+    (typeof svgPathProperties === "function")
+      ? svgPathProperties
+      : ((svgPathProperties && svgPathProperties.svgPathProperties) ||
+         (svgPathProperties && svgPathProperties.default));
+  if (typeof SvgPathProperties !== "function") {
+    alert("svgPathProperties library did not load correctly.");
+    return;
+  }
+
+  // Build a properties object for the selected path and get its total length.
+  const props = new SvgPathProperties(d);
+  const length = props.getTotalLength();
+
+  if (length === 0) {
+    alert("This path appears to have zero length!");
+    return;
+  }
+
+  let dist = 0;
+  while (dist <= length) {
+    const point = props.getPointAtLength(dist);
+    // Save the point in the SVG's native coordinate system.
+    generatedPoints.push({ x: point.x, y: point.y });
+
+    // Increment the distance by a random step (now in 'SVG-pixel' units)
+    const step = minDistPx + Math.random() * (maxDistPx - minDistPx);
+    dist += step;
+  }
+
+  // Ensure at least one final point at the end if loop missed it
+  if (generatedPoints.length === 0) {
+    const endPt = props.getPointAtLength(length);
+    generatedPoints.push({ x: endPt.x, y: endPt.y });
+  }
+
+  drawGeneratedPoints();
+}
+
+// Draw each generated point on the map by converting the local (SVG) point
+// (with the current transformation applied) into geographic coordinates.
+function drawGeneratedPoints() {
+  // Remove previous markers
+  circleMarkers.forEach(m => map.removeLayer(m));
+  circleMarkers = [];
+
+  // Get the current transformation matrix of the SVG group.
+  const ctm = svgGroup.node.getCTM();
+
+  generatedPoints.forEach((pt) => {
+    // Apply the CTM (translation, scaling, rotation) to the generated point.
+    const xTrans = pt.x * ctm.a + pt.y * ctm.c + ctm.e;
+    const yTrans = pt.x * ctm.b + pt.y * ctm.d + ctm.f;
+
+    // Convert the transformed SVG coordinates to geographic coordinates.
+    const latlng = pixelOffsetToLatLng(xTrans, yTrans, svgLayer, localSVGWidth, localSVGHeight);
+    const circle = L.circleMarker(latlng, {
+      radius: 3,
+      color: 'red',
+      fillOpacity: 1
+    }).addTo(map);
+    circleMarkers.push(circle);
+  });
+}
+
+// Export the generated points as a GeoJSON file
+function exportGeoJSON() {
+  if (generatedPoints.length === 0) {
+    alert("No generated points to export!");
+    return;
+  }
+  const features = generatedPoints.map((pt, idx) => {
+    const latlng = pixelOffsetToLatLng(pt.x, pt.y, svgLayer, localSVGWidth, localSVGHeight);
+    return {
+      type: "Feature",
+      properties: { index: idx },
+      geometry: {
+        type: "Point",
+        coordinates: [latlng.lng, latlng.lat]
+      }
+    };
+  });
+
+  const geojson = {
+    type: "FeatureCollection",
+    features: features
+  };
+
+  const dataStr = "data:text/json;charset=utf-8," +
+                  encodeURIComponent(JSON.stringify(geojson, null, 2));
+  const link = document.createElement('a');
+  link.setAttribute('href', dataStr);
+  link.setAttribute('download', "points.geojson");
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+// Update the overlay bounds based on the current SVG transformation (for dragging)
+function updateOverlayBounds() {
+  if (!svgGroup || !svgLayer || !map) return;
+
+  const ctm = svgGroup.node.getCTM();
+  if (!ctm) return;
+
+  // Get current bounds and compute the geographic translation from the CTM.
+  const bounds = svgLayer._bounds;
+  const sw = bounds.getSouthWest();
+  const ne = bounds.getNorthEast();
+
+  // Calculate how many geographic units per SVG unit (using localSVGWidth/Height).
+  const pixelsPerLng = (ne.lng - sw.lng) / localSVGWidth;
+  const pixelsPerLat = (ne.lat - sw.lat) / localSVGHeight;
+  
+  // Note: Negative sign for latitude because SVG Y increases down and latitude increases up.
+  const dLng = ctm.e * pixelsPerLng;
+  const dLat = -ctm.f * pixelsPerLat;
+
+  // Update the bounds with the computed offsets.
+  const newBounds = L.latLngBounds(
+    [sw.lat + dLat, sw.lng + dLng],
+    [ne.lat + dLat, ne.lng + dLng]
+  );
+
+  svgLayer._bounds = newBounds;
+  svgLayer._updatePosition();
+}
+
+// Initialize the map when the page loads
+initMap();
+
+// Hook up the file uploader
+document.getElementById('svgFile').addEventListener('change', (evt) => {
+  const file = evt.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    onSVGUploaded(e.target.result);
+  };
+  reader.readAsText(file);
+});
+
+// Hook up the buttons
+document.getElementById('btnGenerate').addEventListener('click', generatePoints);
+document.getElementById('btnExport').addEventListener('click', exportGeoJSON);
+</script>
+</body>
+</html>
